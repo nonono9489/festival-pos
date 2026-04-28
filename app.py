@@ -29,9 +29,13 @@ CREDENTIALS_FILE = "credentials.json"             # ← 서비스 계정 키 파
 # ─────────────────────────────────────────────
 def get_sheets_service():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     return build("sheets", "v4", credentials=creds)
-
 def append_order(order: dict):
     """주문 1건을 스프레드시트에 추가"""
     service = get_sheets_service()
