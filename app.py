@@ -1,7 +1,8 @@
 from flask import Flask, render_template, request, jsonify
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+from google.auth.transport.requests import AuthorizedSession
 from datetime import datetime
+from urllib.parse import quote
 import json
 import os
 import time
@@ -10,7 +11,6 @@ app = Flask(__name__)
 
 # ─────────────────────────────────────────────
 # ✏️  기본 메뉴 (최초 init 시에만 사용됨)
-# 이후에는 구글 시트 '메뉴설정' 탭에서 관리
 # ─────────────────────────────────────────────
 DEFAULT_MENU = {
     "닭꼬치 순한맛": 4000,
@@ -22,7 +22,7 @@ DEFAULT_MENU = {
 # ─────────────────────────────────────────────
 # ✏️  관리자 비밀번호
 # ─────────────────────────────────────────────
-ADMIN_PASSWORD = "3927"   # ← 원하는 비밀번호로 변경
+ADMIN_PASSWORD = "3927"
 
 # ─────────────────────────────────────────────
 # ✏️  구글 스프레드시트 설정
@@ -32,23 +32,52 @@ SHEET_ORDER      = "주문내역"
 SHEET_MENU       = "메뉴설정"
 CREDENTIALS_FILE = "credentials.json"
 
-# ─────────────────────────────────────────────
-# Google Sheets 연결 (싱글톤 — 프로세스당 1회 생성)
-# ─────────────────────────────────────────────
-_sheets_service = None
+_API_BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
 
-def get_sheets_service():
-    global _sheets_service
-    if _sheets_service is not None:
-        return _sheets_service
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if creds_json:
-        creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    return _sheets_service
+# ─────────────────────────────────────────────
+# Google Sheets 연결 (AuthorizedSession 싱글톤)
+# google-api-python-client 제거 → requests 직접 호출
+# httplib2 thread-safety 문제 없음, 메모리 대폭 절감
+# ─────────────────────────────────────────────
+_session = None
+
+def get_session():
+    global _session
+    if _session is None:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes)
+        else:
+            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+        _session = AuthorizedSession(creds)
+    return _session
+
+def _rurl(rng):
+    return f"{_API_BASE}/values/{quote(rng)}"
+
+def sheets_get(rng):
+    r = get_session().get(_rurl(rng))
+    r.raise_for_status()
+    return r.json().get("values", [])
+
+def sheets_update(rng, values):
+    r = get_session().put(
+        _rurl(rng) + "?valueInputOption=USER_ENTERED",
+        json={"values": values},
+    )
+    r.raise_for_status()
+
+def sheets_clear(rng):
+    r = get_session().post(_rurl(rng) + ":clear")
+    r.raise_for_status()
+
+def sheets_append(rng, values):
+    r = get_session().post(
+        _rurl(rng) + ":append?valueInputOption=USER_ENTERED",
+        json={"values": values},
+    )
+    r.raise_for_status()
 
 # ─────────────────────────────────────────────
 # 메뉴 캐시 (30초 TTL — 관리자 변경 시 즉시 무효화)
@@ -61,56 +90,33 @@ def invalidate_menu_cache():
     global _menu_cache
     _menu_cache = None
 
-# ─────────────────────────────────────────────
-# 메뉴 관련
-# ─────────────────────────────────────────────
 def get_menu_from_sheet():
-    """'메뉴설정' 시트에서 메뉴 목록 읽기 (캐시 적용)"""
     global _menu_cache, _menu_cache_time
     if _menu_cache is not None and time.time() - _menu_cache_time < MENU_CACHE_TTL:
         return _menu_cache
-    service = get_sheets_service()
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_MENU}!A2:C",
-    ).execute()
-    rows = result.get("values", [])
+    rows = sheets_get(f"{SHEET_MENU}!A2:C")
     menus = []
     for row in rows:
         if len(row) < 2:
             continue
-        name     = row[0]
-        price    = int(row[1]) if row[1].isdigit() else 0
-        soldout  = row[2].strip() == "Y" if len(row) > 2 else False
+        name    = row[0]
+        price   = int(row[1]) if row[1].isdigit() else 0
+        soldout = row[2].strip() == "Y" if len(row) > 2 else False
         menus.append({"name": name, "price": price, "soldout": soldout})
     _menu_cache = menus
     _menu_cache_time = time.time()
     return menus
 
 def save_menu_to_sheet(menus: list):
-    """메뉴 목록 전체를 '메뉴설정' 시트에 저장"""
-    service = get_sheets_service()
     rows = [[m["name"], m["price"], "Y" if m.get("soldout") else "N"] for m in menus]
-    service.spreadsheets().values().clear(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_MENU}!A2:C",
-    ).execute()
+    sheets_clear(f"{SHEET_MENU}!A2:C")
     if rows:
-        service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_MENU}!A2",
-            valueInputOption="USER_ENTERED",
-            body={"values": rows},
-        ).execute()
+        sheets_update(f"{SHEET_MENU}!A2", rows)
     invalidate_menu_cache()
 
 # ─────────────────────────────────────────────
 # 주문 관련
 # ─────────────────────────────────────────────
-def get_menu_keys():
-    """현재 시트의 메뉴 이름 목록만 반환"""
-    return [m["name"] for m in get_menu_from_sheet()]
-
 def col_total(menu_keys):
     return 2 + len(menu_keys)
 
@@ -118,12 +124,7 @@ def col_status(menu_keys):
     return 2 + len(menu_keys) + 1
 
 def get_all_order_rows():
-    service = get_sheets_service()
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_ORDER}!A2:Z",
-    ).execute()
-    return result.get("values", [])
+    return sheets_get(f"{SHEET_ORDER}!A2:Z")
 
 def get_next_order_number(rows):
     today = datetime.now().strftime("%Y-%m-%d")
@@ -131,19 +132,13 @@ def get_next_order_number(rows):
     return len(today_orders) + 1
 
 def append_order(order: dict, menu_keys: list, price_map: dict):
-    service = get_sheets_service()
     rows = get_all_order_rows()
     order_no_str = f"{get_next_order_number(rows):03d}"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     quantities = [order.get(menu, 0) for menu in menu_keys]
     total = sum(price_map.get(menu, 0) * order.get(menu, 0) for menu in menu_keys)
     row = [order_no_str, timestamp] + quantities + [total, "대기중"]
-    service.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_ORDER}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": [row]},
-    ).execute()
+    sheets_append(f"{SHEET_ORDER}!A1", [row])
     return order_no_str
 
 def get_summary(menu_keys):
@@ -203,7 +198,6 @@ def get_pending_orders(menu_keys):
     return pending
 
 def complete_order(sheet_row: int, menu_keys: list):
-    service = get_sheets_service()
     cs = col_status(menu_keys)
     col_letter = ""
     n = cs
@@ -213,37 +207,16 @@ def complete_order(sheet_row: int, menu_keys: list):
         if n < 0:
             break
     cell = f"{SHEET_ORDER}!{col_letter}{sheet_row}"
-    service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=cell,
-        valueInputOption="USER_ENTERED",
-        body={"values": [["완료"]]},
-    ).execute()
+    sheets_update(cell, [["완료"]])
 
 def init_sheets():
-    """주문내역 + 메뉴설정 시트 초기화"""
-    service = get_sheets_service()
     menus = list(DEFAULT_MENU.items())
     menu_names = [m[0] for m in menus]
-
-    # 주문내역 헤더
     order_headers = ["주문번호", "타임스탬프"] + menu_names + ["합계금액", "완료여부"]
-    service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_ORDER}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": [order_headers]},
-    ).execute()
-
-    # 메뉴설정 헤더 + 기본 메뉴
+    sheets_update(f"{SHEET_ORDER}!A1", [order_headers])
     menu_header = [["메뉴명", "가격", "솔드아웃(Y/N)"]]
     menu_rows   = [[name, price, "N"] for name, price in menus]
-    service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_MENU}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": menu_header + menu_rows},
-    ).execute()
+    sheets_update(f"{SHEET_MENU}!A1", menu_header + menu_rows)
 
 # ─────────────────────────────────────────────
 # 라우트
