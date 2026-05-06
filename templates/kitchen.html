@@ -127,7 +127,7 @@
 
 <div class="refresh-bar">
   <span class="last-updated" id="lastUpdated">불러오는 중...</span>
-  <span class="auto-badge">🔄 15초 자동갱신</span>
+  <span class="auto-badge">🔄 5초 자동갱신</span>
 </div>
 
 <div class="order-list" id="orderList"></div>
@@ -218,9 +218,9 @@ async function completeOrder(sheetRow, btn) {
   }
 }
 
-// 초기 로드 + 15초 자동 갱신
+// 초기 로드 + 5초 자동 갱신
 loadOrders();
-setInterval(loadOrders, 15000);
+setInterval(loadOrders, 5000);
 </script>
 </body>
 </html>

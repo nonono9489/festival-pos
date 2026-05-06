@@ -4,6 +4,7 @@ from googleapiclient.discovery import build
 from datetime import datetime
 import json
 import os
+import time
 
 app = Flask(__name__)
 
@@ -32,22 +33,42 @@ SHEET_MENU       = "메뉴설정"
 CREDENTIALS_FILE = "credentials.json"
 
 # ─────────────────────────────────────────────
-# Google Sheets 연결
+# Google Sheets 연결 (싱글톤 — 프로세스당 1회 생성)
 # ─────────────────────────────────────────────
+_sheets_service = None
+
 def get_sheets_service():
+    global _sheets_service
+    if _sheets_service is not None:
+        return _sheets_service
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json:
         creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes)
     else:
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    return build("sheets", "v4", credentials=creds)
+    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _sheets_service
+
+# ─────────────────────────────────────────────
+# 메뉴 캐시 (30초 TTL — 관리자 변경 시 즉시 무효화)
+# ─────────────────────────────────────────────
+_menu_cache = None
+_menu_cache_time = 0.0
+MENU_CACHE_TTL = 30
+
+def invalidate_menu_cache():
+    global _menu_cache
+    _menu_cache = None
 
 # ─────────────────────────────────────────────
 # 메뉴 관련
 # ─────────────────────────────────────────────
 def get_menu_from_sheet():
-    """'메뉴설정' 시트에서 메뉴 목록 읽기"""
+    """'메뉴설정' 시트에서 메뉴 목록 읽기 (캐시 적용)"""
+    global _menu_cache, _menu_cache_time
+    if _menu_cache is not None and time.time() - _menu_cache_time < MENU_CACHE_TTL:
+        return _menu_cache
     service = get_sheets_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -62,13 +83,14 @@ def get_menu_from_sheet():
         price    = int(row[1]) if row[1].isdigit() else 0
         soldout  = row[2].strip() == "Y" if len(row) > 2 else False
         menus.append({"name": name, "price": price, "soldout": soldout})
+    _menu_cache = menus
+    _menu_cache_time = time.time()
     return menus
 
 def save_menu_to_sheet(menus: list):
     """메뉴 목록 전체를 '메뉴설정' 시트에 저장"""
     service = get_sheets_service()
     rows = [[m["name"], m["price"], "Y" if m.get("soldout") else "N"] for m in menus]
-    # 기존 데이터 지우고 다시 쓰기
     service.spreadsheets().values().clear(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{SHEET_MENU}!A2:C",
@@ -80,6 +102,7 @@ def save_menu_to_sheet(menus: list):
             valueInputOption="USER_ENTERED",
             body={"values": rows},
         ).execute()
+    invalidate_menu_cache()
 
 # ─────────────────────────────────────────────
 # 주문 관련
